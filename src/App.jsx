@@ -1,11 +1,16 @@
 import { useMemo, useState } from "react";
-import { Upload, FileText, Download, Sparkles } from "lucide-react";
+import { Upload, FileText, Download } from "lucide-react";
 
 const API_URL = import.meta.env.VITE_API_URL;
+
+function fmtMB(bytes) {
+  return (bytes / 1024 / 1024).toFixed(2);
+}
 
 export default function App() {
   const [files, setFiles] = useState([]);
   const [processing, setProcessing] = useState(false);
+  const [phase, setPhase] = useState(""); // status line
   const [report, setReport] = useState("");
   const [error, setError] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -15,49 +20,44 @@ export default function App() {
     return `${files.length} ${files.length === 1 ? "file" : "files"}`;
   }, [files.length]);
 
-const handleFileSelect = (e) => {
-  const selected = Array.from(e.target.files || []);
-  if (selected.length === 0) return;
-
-  for (const file of selected) {
-
-    // BLOQUEAR > 50MB
-    if (file.size > 50 * 1024 * 1024) {
-      setError(`"${file.name}" exceeds the 50MB limit.`);
-      return;
+  function validateAndWarn(list) {
+    for (const file of list) {
+      // hard limit
+      if (file.size > 50 * 1024 * 1024) {
+        setError(`"${file.name}" exceeds the 50MB limit.`);
+        return false;
+      }
+      // soft warning
+      if (file.size > 20 * 1024 * 1024) {
+        alert(`"${file.name}" is large and may take up to 3 minutes to process.`);
+      }
     }
-
-    // AVISAR > 20MB
-    if (file.size > 20 * 1024 * 1024) {
-      alert(`"${file.name}" is large and may take up to 3 minutes to process.`);
-    }
+    return true;
   }
 
-  setFiles((prev) => [...prev, ...selected]);
-  setError("");
-};
- const handleDrop = (e) => {
-  e.preventDefault();
-  setDragOver(false);
+  const handleFileSelect = (e) => {
+    const selected = Array.from(e.target.files || []);
+    if (selected.length === 0) return;
 
-  const dropped = Array.from(e.dataTransfer.files || []);
-  if (dropped.length === 0) return;
+    setError("");
+    if (!validateAndWarn(selected)) return;
 
-  for (const file of dropped) {
+    setFiles((prev) => [...prev, ...selected]);
+  };
 
-    if (file.size > 50 * 1024 * 1024) {
-      setError(`"${file.name}" exceeds the 50MB limit.`);
-      return;
-    }
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setDragOver(false);
 
-    if (file.size > 20 * 1024 * 1024) {
-      alert(`"${file.name}" is large and may take up to 3 minutes to process.`);
-    }
-  }
+    const dropped = Array.from(e.dataTransfer.files || []);
+    if (dropped.length === 0) return;
 
-  setFiles((prev) => [...prev, ...dropped]);
-  setError("");
-};
+    setError("");
+    if (!validateAndWarn(dropped)) return;
+
+    setFiles((prev) => [...prev, ...dropped]);
+  };
+
   const removeFile = (index) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
   };
@@ -67,10 +67,15 @@ const handleFileSelect = (e) => {
     formData.append("file", file);
 
     const res = await fetch(`${API_URL}/api/ocr`, { method: "POST", body: formData });
+
     if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(`OCR erro (${res.status}): ${txt}`);
+      const contentType = res.headers.get("content-type") || "";
+      const body = contentType.includes("application/json") ? await res.json() : await res.text();
+      const details =
+        typeof body === "string" ? body.slice(0, 400) : JSON.stringify(body, null, 2).slice(0, 900);
+      throw new Error(`OCR error (${res.status}): ${details}`);
     }
+
     const data = await res.json();
     const text = data?.text || "";
     return `Document: ${file.name}\n\n${text}\n`;
@@ -82,17 +87,26 @@ const handleFileSelect = (e) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     });
+
     if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(`Analyze erro (${res.status}): ${txt}`);
+      const contentType = res.headers.get("content-type") || "";
+      const body = contentType.includes("application/json") ? await res.json() : await res.text();
+      const details =
+        typeof body === "string" ? body.slice(0, 400) : JSON.stringify(body, null, 2).slice(0, 900);
+      throw new Error(`Analyze error (${res.status}): ${details}`);
     }
+
     const data = await res.json();
     return data?.report ? data.report : JSON.stringify(data, null, 2);
   }
 
   const run = async () => {
+    if (!API_URL) {
+      setError("Configuration error: missing VITE_API_URL.");
+      return;
+    }
     if (files.length === 0) {
-      setError("Please upload at least one file");
+      setError("Please upload at least one PDF file.");
       return;
     }
 
@@ -101,15 +115,22 @@ const handleFileSelect = (e) => {
     setReport("");
 
     try {
+      setPhase("Extracting document content (OCR)");
       const parts = [];
       for (const f of files) parts.push(await ocrFile(f));
       const combined = parts.join("\n\n");
+
+      setPhase("Structuring clinical data using AI");
       const r = await analyzeText(combined);
+
+      setPhase("Generating standardized consultation note");
       setReport(r);
     } catch (e) {
-      setError(e.message || "Processing error");
+      setError("We encountered a temporary processing issue. Please try again.");
+      console.error(e);
     } finally {
       setProcessing(false);
+      setPhase("");
     }
   };
 
@@ -117,6 +138,7 @@ const handleFileSelect = (e) => {
     setFiles([]);
     setReport("");
     setError("");
+    setPhase("");
   };
 
   const downloadTxt = () => {
@@ -124,7 +146,7 @@ const handleFileSelect = (e) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `medical_report_${new Date().toISOString().split("T")[0]}.txt`;
+    a.download = `first_visit_note_${new Date().toISOString().split("T")[0]}.txt`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -132,18 +154,26 @@ const handleFileSelect = (e) => {
   return (
     <div className="container">
       <div className="center">
-        <div className="badge">
-          <Sparkles size={16} />
-          Powered by AI
+        <div className="badge" title="Exclusive prototype">
+          <span>
+            Proprietary MVP developed exclusively for ARA Group
+            <br />
+            <span style={{ fontWeight: 600, opacity: 0.9 }}>
+              by ProEx (AI &amp; Operational Excellence)
+            </span>
+          </span>
         </div>
 
         <div className="h1">
-          Medical Report
+          Advanced Clinical Documentation Engine
           <br />
-          Analyzer
+          for Assisted Reproductive Technology
         </div>
 
-        <p className="p">Intelligent analysis for fertility documents</p>
+        <p className="p">
+          This prototype system processes laboratory and clinical documentation and generates a structured First Visit
+          Note aligned with ART/IVF consultation standards.
+        </p>
       </div>
 
       {error && <div className="error">{error}</div>}
@@ -165,26 +195,30 @@ const handleFileSelect = (e) => {
                 id="fileInput"
                 type="file"
                 multiple
-                accept=".pdf,.jpg,.jpeg,.png"
+                accept=".pdf"
                 onChange={handleFileSelect}
                 style={{ display: "none" }}
               />
 
               <div className="iconBox">
-                <Upload size={28} />
+                <Upload size={26} />
               </div>
 
-              <p className="dropTitle">Drop medical files here</p>
-              <p className="dropSub">or click to browse</p>
-              <p className="dropHint">Supports PDF, JPG, PNG</p>
+              <p className="dropTitle">Upload Clinical Documentation</p>
+              <p className="dropSub">Supports PDF files up to 50MB.</p>
+              <p className="dropHint">
+                Large documents may require up to 3 minutes for processing.
+                <br />
+                The system performs OCR extraction and AI-assisted structuring of uploaded medical documentation.
+              </p>
             </div>
 
             {files.length > 0 && (
               <div className="files">
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
                   <p style={{ margin: 0, fontWeight: 750 }}>{fileCountLabel}</p>
                   <p style={{ margin: 0, color: "var(--muted)", fontSize: 13 }}>
-                    Tip: multi-file works (OCR each, then one combined report)
+                    Total size: {fmtMB(files.reduce((a, f) => a + f.size, 0))} MB
                   </p>
                 </div>
 
@@ -196,7 +230,7 @@ const handleFileSelect = (e) => {
                       </div>
                       <div>
                         <p className="fileName">{file.name}</p>
-                        <p className="fileMeta">{(file.size / 1024 / 1024).toFixed(2)} MB</p>
+                        <p className="fileMeta">{fmtMB(file.size)} MB</p>
                       </div>
                     </div>
                     <button className="x" onClick={() => removeFile(idx)} aria-label="Remove file">
@@ -210,23 +244,23 @@ const handleFileSelect = (e) => {
             {processing && (
               <div className="progress">
                 <div className="spinner" />
-                <p className="h2">Analyzing with AI</p>
+                <p className="h2">{phase || "Processing..."}</p>
                 <p className="small">
-                  Processing document with OCR and generating a compact first visit note.
+                  For large PDFs, processing may take up to 2–3 minutes.
                   <br />
-                  (May take 30–90 seconds)
+                  Please keep this tab open until completion.
                 </p>
               </div>
             )}
 
             <button className="btn" onClick={run} disabled={processing || files.length === 0}>
-              {processing ? "Processing..." : "Analyze Documents"}
+              {processing ? "Processing..." : "Generate First Visit Report"}
             </button>
           </>
         ) : (
           <>
             <div className="resultsHead">
-              <div className="h2">Generated Report</div>
+              <div className="h2">Structured First Visit Note (AI-Generated)</div>
               <div className="actions">
                 <button className="btn2 primary" onClick={downloadTxt}>
                   <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
@@ -240,6 +274,10 @@ const handleFileSelect = (e) => {
               </div>
             </div>
 
+            <p className="small" style={{ marginTop: 0 }}>
+              Please review clinical accuracy before use in medical decision-making.
+            </p>
+
             <div className="report">
               <pre>{report}</pre>
             </div>
@@ -247,7 +285,11 @@ const handleFileSelect = (e) => {
         )}
       </div>
 
-      <div className="footer">MVP Demo • AI-powered medical analysis</div>
+      <div className="footer">
+        This prototype solution has been developed exclusively for ARA Group by ProEx.
+        <br />
+        Outputs are AI-assisted and require professional clinical validation before clinical application.
+      </div>
     </div>
   );
 }
